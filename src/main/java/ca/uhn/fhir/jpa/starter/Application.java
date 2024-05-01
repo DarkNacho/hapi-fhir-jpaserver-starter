@@ -57,6 +57,11 @@ public class Application extends SpringBootServletInitializer {
 	@Conditional(OnEitherVersion.class)
 	public ServletRegistrationBean hapiServletRegistration(RestfulServer restfulServer) {
 		ServletRegistrationBean servletRegistrationBean = new ServletRegistrationBean();
+
+		//register interceptors
+		restfulServer.registerInterceptor(new YourInterceptor());
+		restfulServer.registerInterceptor(new JWTSecurityInterceptor());
+
 		beanFactory.autowireBean(restfulServer);
 		servletRegistrationBean.setServlet(restfulServer);
 		servletRegistrationBean.addUrlMappings("/fhir/*");
