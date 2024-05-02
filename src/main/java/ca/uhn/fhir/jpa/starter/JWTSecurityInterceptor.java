@@ -136,28 +136,35 @@ public class JWTSecurityInterceptor extends AuthorizationInterceptor {
             .build();
     }
 
+
     private List<IAuthRule> buildPractitionerRules(String userId, RequestDetails theRequestDetails) {
-        if ("Patient".equals(theRequestDetails.getResourceName())) {
-            return buildPractitionerPatientRules(userId);
-        } else {
-            return buildPractitionerOtherRules(userId);
-        }
-    }
-    
-    private List<IAuthRule> buildPractitionerPatientRules(String userId) {
+        if(theRequestDetails.getRequestPath().equals("Questionnaire"))
+            return new RuleBuilder().allowAll().build();
+        
+        
         return new RuleBuilder()
             .allow().read().resourcesOfType(Patient.class)
             .inCompartment("Practitioner", new IdType("Practitioner", userId))
             .andThen()
-            .denyAll()
-            .build();
-    }
-   
-    private List<IAuthRule> buildPractitionerOtherRules(String userId) {
-        return new RuleBuilder()
-            .allow()
-            .read()
-            .allResources()
+            .allow().write().resourcesOfType(Patient.class)
+            .inCompartment("Practitioner", new IdType("Practitioner", userId))
+            .andThen()
+            .allow().create().resourcesOfType(Patient.class)
+            .inCompartment("Practitioner", new IdType("Practitioner", userId))
+            .andThen()
+            .allow().delete().resourcesOfType(Patient.class)
+            .inCompartment("Practitioner", new IdType("Practitioner", userId))
+            .andThen()
+            .allow().read().allResources()
+            .inCompartment("Practitioner", new IdType("Practitioner", userId))
+            .andThen()
+            .allow().write().allResources()
+            .inCompartment("Practitioner", new IdType("Practitioner", userId))
+            .andThen()
+            .allow().create().allResources()
+            .inCompartment("Practitioner", new IdType("Practitioner", userId))
+            .andThen()
+            .allow().delete().allResources()
             .inCompartment("Practitioner", new IdType("Practitioner", userId))
             .andThen()
             .denyAll()
