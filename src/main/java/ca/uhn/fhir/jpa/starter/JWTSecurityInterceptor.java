@@ -25,7 +25,6 @@ import io.jsonwebtoken.SignatureAlgorithm;
 import java.security.Key;
 import io.jsonwebtoken.security.Keys;
 import io.jsonwebtoken.security.SignatureException;
-import org.springframework.http.HttpMethod;
 import io.jsonwebtoken.ExpiredJwtException;
 
 import org.hl7.fhir.r4.model.Bundle;
@@ -33,10 +32,6 @@ import org.hl7.fhir.r4.model.Bundle;
 import org.hl7.fhir.r4.model.IdType;
 
 import org.hl7.fhir.r4.model.Patient;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.client.RestTemplate;
 
 /**
  * This class is an implementation of the AuthorizationInterceptor class and
@@ -152,10 +147,11 @@ public class JWTSecurityInterceptor extends AuthorizationInterceptor {
 
     private List<IAuthRule> buildPractitionerRules(String userId, RequestDetails theRequestDetails) {
         System.out.println("Buscando pacientes con general practitioner id: " + userId);
-        var patients = getPatientsWithPractitioner(theRequestDetails, userId);
+        var patients = getPatientsWithPractitioner(theRequestDetails, userId); // get patients that the practitioner has
+                                                                               // access
         System.out.println("Patients con practitioner id tamaño: " + patients.size());
 
-        RuleBuilder ruleBuilder = new RuleBuilder();
+        RuleBuilder ruleBuilder = new RuleBuilder(); // Allow the practitioner to read/write their patients
         for (var patient : patients) {
             System.out.println("Patient: " + patient.getIdPart());
             ruleBuilder.allow().read().allResources().inCompartment("Patient",
@@ -164,10 +160,26 @@ public class JWTSecurityInterceptor extends AuthorizationInterceptor {
                     new IdType(patient.getResourceType(), patient.getIdPart())).andThen();
         }
 
-        ruleBuilder.allow().create().resourcesOfType("Patient").withAnyId().andThen();
-        ruleBuilder.denyAll("Deny all Practitioner Role");
+        ruleBuilder.allow().create().resourcesOfType("Patient").withAnyId().andThen(); // allow create new patient
 
-        return ruleBuilder.build();
+        ruleBuilder.allow().read().resourcesOfType(Patient.class)
+                .inCompartment("Practitioner", new IdType("Practitioner", userId)).andThen();
+
+        ruleBuilder.allow().read().resourcesOfType("Practitioner")
+                .inCompartment("Practitioner", new IdType("Practitioner", userId)).andThen()
+                .allow().write().resourcesOfType("Practitioner")
+                .inCompartment("Practitioner", new IdType("Practitioner", userId)).andThen();
+
+        // Allow the practitioner to read/write their encounters and questionnaires
+        ruleBuilder.allow().read().resourcesOfType("Encounter")
+                .inCompartment("Practitioner", new IdType("Practitioner", userId)).andThen()
+                .allow().write().resourcesOfType("Encounter")
+                .inCompartment("Practitioner", new IdType("Practitioner", userId)).andThen();
+
+        ruleBuilder.allow().read().resourcesOfType("Questionnaire").withAnyId().andThen()
+                .allow().write().resourcesOfType("Questionnaire").withAnyId().andThen();
+
+        return ruleBuilder.denyAll("Deny all Practitioner Role").build();
     }
 
     private List<IdType> getPatientsWithPractitioner(RequestDetails theRequestDetails, String practitionerId) {
