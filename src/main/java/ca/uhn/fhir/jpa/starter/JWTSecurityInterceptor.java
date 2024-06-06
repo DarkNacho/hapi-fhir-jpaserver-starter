@@ -2,8 +2,15 @@ package ca.uhn.fhir.jpa.starter;
 
 import ca.uhn.fhir.rest.server.interceptor.auth.RuleBuilder;
 import ca.uhn.fhir.rest.server.interceptor.auth.IAuthRule;
+import ca.uhn.fhir.context.BaseRuntimeChildDefinition;
+import ca.uhn.fhir.context.BaseRuntimeElementDefinition;
 import ca.uhn.fhir.context.FhirContext;
+import ca.uhn.fhir.context.RuntimeResourceDefinition;
+import ca.uhn.fhir.interceptor.api.Hook;
+import ca.uhn.fhir.interceptor.api.Interceptor;
+import ca.uhn.fhir.interceptor.api.Pointcut;
 import ca.uhn.fhir.rest.api.server.RequestDetails;
+import ca.uhn.fhir.rest.api.server.ResponseDetails;
 import ca.uhn.fhir.rest.client.api.IGenericClient;
 import ca.uhn.fhir.rest.client.interceptor.BearerTokenAuthInterceptor;
 import ca.uhn.fhir.rest.gclient.TokenClientParam;
@@ -28,10 +35,14 @@ import io.jsonwebtoken.security.SignatureException;
 import io.jsonwebtoken.ExpiredJwtException;
 
 import org.hl7.fhir.r4.model.Bundle;
-//---
+import org.hl7.fhir.r4.model.DocumentReference;
 import org.hl7.fhir.r4.model.IdType;
-
 import org.hl7.fhir.r4.model.Patient;
+import org.hl7.fhir.r4.model.Reference;
+import org.springframework.data.util.Pair;
+import org.hl7.fhir.instance.model.api.IBase;
+import org.hl7.fhir.instance.model.api.IBaseResource;
+import org.hl7.fhir.r4.model.Binary;
 
 /**
  * This class is an implementation of the AuthorizationInterceptor class and
@@ -44,10 +55,45 @@ import org.hl7.fhir.r4.model.Patient;
  * If the user role is unauthorized, an AuthenticationException is thrown.
  * If the request path is unauthenticated, a set of default rules is applied.
  */
+@Interceptor
 public class JWTSecurityInterceptor extends AuthorizationInterceptor {
 
     private static final String SECRET_KEY = System.getenv("SECRET_KEY");
     private static final Key DECODED_SECRET_KEY = Keys.hmacShaKeyFor(SECRET_KEY.getBytes());
+
+    private IGenericClient client = null;
+    private String jwtToken = null;
+    private Date jwtExpiration = null;
+
+    private Pair<String, String> getUserRoleAndId(String jwtToken) throws AuthenticationException {
+        try {
+            Jws<Claims> claimsJws = parseJwtToken(jwtToken);
+            Claims claims = claimsJws.getBody();
+
+            String userRole = (String) claims.get("role");
+            if (userRole == null) {
+                throw new AuthenticationException("User role not present in token");
+            }
+            System.out.println("User Role: " + userRole);
+
+            String userId = (String) claims.get("id");
+            if (userId == null && !userRole.equals("Admin")) {
+                throw new AuthenticationException("User id not present in token");
+            } else if (userId == null && userRole.equals("Admin")) {
+                userId = "Admin";
+            }
+            System.out.println("User Id: " + userId);
+            Pair<String, String> userRoleAndId = Pair.of(userRole, userId);
+
+            return userRoleAndId;
+        } catch (ExpiredJwtException e) {
+            throw new AuthenticationException("Token is expired");
+        } catch (SignatureException e) {
+            throw new AuthenticationException("Invalid token");
+        } catch (Exception e) {
+            throw new AuthenticationException("Authentication failed: " + e.getMessage());
+        }
+    }
 
     @Override
     public List<IAuthRule> buildRuleList(RequestDetails theRequestDetails) {
@@ -73,21 +119,10 @@ public class JWTSecurityInterceptor extends AuthorizationInterceptor {
         System.out.println("Token: " + jwtToken);
 
         try {
-            Jws<Claims> claimsJws = parseJwtToken(jwtToken);
-            Claims claims = claimsJws.getBody();
-
-            String userRole = (String) claims.get("role");
-            System.out.println("User Role: " + userRole);
-            String userId = (String) claims.get("id");
-            System.out.println("User Id: " + userId);
-
-            return buildRulesBasedOnUserRole(userRole, userId, theRequestDetails);
-        } catch (ExpiredJwtException e) {
-            throw new AuthenticationException("Token is expired");
-        } catch (SignatureException e) {
-            throw new AuthenticationException("Invalid token");
-        } catch (Exception e) {
-            throw new AuthenticationException("Authentication failed: " + e.getMessage());
+            Pair<String, String> userRoleAndId = getUserRoleAndId(jwtToken);
+            return buildRulesBasedOnUserRole(userRoleAndId.getFirst(), userRoleAndId.getSecond(), theRequestDetails);
+        } catch (AuthenticationException e) {
+            throw e;
         }
     }
 
@@ -170,11 +205,18 @@ public class JWTSecurityInterceptor extends AuthorizationInterceptor {
                 .allow().write().resourcesOfType("Practitioner")
                 .inCompartment("Practitioner", new IdType("Practitioner", userId)).andThen();
 
-        // Allow the practitioner to read/write their encounters and questionnaires
         ruleBuilder.allow().read().resourcesOfType("Encounter")
                 .inCompartment("Practitioner", new IdType("Practitioner", userId)).andThen()
                 .allow().write().resourcesOfType("Encounter")
                 .inCompartment("Practitioner", new IdType("Practitioner", userId)).andThen();
+
+        ruleBuilder.allow().read().resourcesOfType("DocumentReference")
+                .inCompartment("Practitioner", new IdType("Practitioner", userId)).andThen()
+                .allow().write().resourcesOfType("DocumentReference")
+                .inCompartment("Practitioner", new IdType("Practitioner", userId)).andThen();
+
+        ruleBuilder.allow().read().resourcesOfType("Binary").withAnyId().andThen()
+                .allow().write().resourcesOfType("Binary").withAnyId().andThen();
 
         ruleBuilder.allow().read().resourcesOfType("Questionnaire").withAnyId().andThen()
                 .allow().write().resourcesOfType("Questionnaire").withAnyId().andThen();
@@ -182,22 +224,37 @@ public class JWTSecurityInterceptor extends AuthorizationInterceptor {
         return ruleBuilder.denyAll("Deny all Practitioner Role").build();
     }
 
-    private List<IdType> getPatientsWithPractitioner(RequestDetails theRequestDetails, String practitionerId) {
+    private IGenericClient createFhirClient(String baseUrl) {
+        if (client == null || jwtToken == null || jwtExpiration == null || jwtExpiration.before(new Date())) {
+            // Create FHIR context and client
+            FhirContext ctx = FhirContext.forR4();
+            client = ctx.newRestfulGenericClient(baseUrl);
+
+            // Generate a new JWT token
+            jwtToken = generateJwtToken();
+
+            // Set the bearer token
+            client.registerInterceptor(new BearerTokenAuthInterceptor(jwtToken));
+        }
+
+        return client;
+    }
+
+    private String generateJwtToken() {
         // Create JWT token
         Map<String, Object> claims = new HashMap<>();
         claims.put("role", "Admin");
-        String jwtToken = Jwts.builder()
+        jwtExpiration = new Date(System.currentTimeMillis() + 60 * 1000); // 1 minute
+        return Jwts.builder()
                 .setClaims(claims)
                 .setExpiration(new Date(System.currentTimeMillis() + 60 * 1000)) // 1 minute
                 .signWith(DECODED_SECRET_KEY, SignatureAlgorithm.HS256)
                 .compact();
+    }
 
-        // Create FHIR context and client
-        FhirContext ctx = FhirContext.forR4();
-        IGenericClient client = ctx.newRestfulGenericClient(theRequestDetails.getFhirServerBase());
+    private List<IdType> getPatientsWithPractitioner(RequestDetails theRequestDetails, String practitionerId) {
 
-        // Set the bearer token
-        client.registerInterceptor(new BearerTokenAuthInterceptor(jwtToken));
+        IGenericClient client = createFhirClient(theRequestDetails.getFhirServerBase());
 
         // Send request and parse result
         Bundle response = client.search()
@@ -211,6 +268,59 @@ public class JWTSecurityInterceptor extends AuthorizationInterceptor {
                 .filter(resource -> resource instanceof Patient)
                 .map(resource -> ((Patient) resource).getIdElement())
                 .collect(Collectors.toList());
+    }
+
+    @Hook(Pointcut.SERVER_OUTGOING_RESPONSE)
+    public void preProcessBinaryResource(RequestDetails theRequest, ResponseDetails theResponseDetails) {
+        if (theResponseDetails.getResponseResource() instanceof Binary) {
+            processBinaryResource(theRequest, theResponseDetails);
+        }
+    }
+
+    private void processBinaryResource(RequestDetails theRequest, ResponseDetails theResponseDetails) {
+        Binary binary = (Binary) theResponseDetails.getResponseResource();
+        String contentType = binary.getContentType();
+        String securityContext = binary.getSecurityContext().getReference().toString();
+        String binaryId = binary.getIdElement().getIdPart();
+        System.out.println("Content Type: " + contentType);
+        System.out.println("Security Context: " + securityContext);
+        System.out.println("Binary Id: " + binaryId);
+
+        String authHeader = theRequest.getHeader("Authorization");
+        String jwtToken = authHeader.substring(7); // Remove "Bearer "
+        System.out.println("Token: " + jwtToken);
+        String userId = getUserRoleAndId(jwtToken).getSecond();
+
+        IGenericClient client = createFhirClient(theRequest.getFhirServerBase());
+        String referenceResouce = binary.getSecurityContext().getReference();
+
+        DocumentReference resource = client.read()
+                .resource(DocumentReference.class)
+                .withUrl(referenceResouce)
+                .execute();
+
+        if (!checkReferences(resource, userId))
+            throw new AuthenticationException("Unauthorized access to binary resource");
+    }
+
+    public boolean checkReferences(IBaseResource resource, String resourceId) {
+        FhirContext ctx = FhirContext.forR4();
+        RuntimeResourceDefinition resourceDef = ctx.getResourceDefinition(resource);
+        for (BaseRuntimeChildDefinition childDef : resourceDef.getChildren()) {
+            List<IBase> childElements = childDef.getAccessor().getValues(resource);
+            for (IBase child : childElements) {
+                BaseRuntimeElementDefinition<?> childElementDef = ctx.getElementDefinition(child.getClass());
+                if (childElementDef.getName().equals("Reference")) {
+                    Reference reference = (Reference) child;
+                    if (reference.getReference().contains(resourceId)) {
+                        return true;
+                    }
+                } else if (childElementDef.getChildType() != null && child instanceof IBaseResource) {
+                    checkReferences((IBaseResource) child, resourceId);
+                }
+            }
+        }
+        return false;
     }
 
 }
