@@ -45,15 +45,54 @@ import org.hl7.fhir.instance.model.api.IBaseResource;
 import org.hl7.fhir.r4.model.Binary;
 
 /**
- * This class is an implementation of the AuthorizationInterceptor class and
- * provides JWT-based security for FHIR requests.
- * It intercepts incoming requests and applies authorization rules based on the
- * JWT token provided in the Authorization header.
- * The class verifies the token, extracts the user role and ID from the token
- * claims, and builds the authorization rules accordingly.
- * If the token is invalid or expired, an AuthenticationException is thrown.
- * If the user role is unauthorized, an AuthenticationException is thrown.
- * If the request path is unauthenticated, a set of default rules is applied.
+ * JWTSecurityInterceptor is an authorization interceptor that handles JWT-based
+ * security for FHIR server requests.
+ * It extends the AuthorizationInterceptor class and provides methods to build
+ * authorization rules based on user roles
+ * extracted from JWT tokens.
+ * 
+ * The interceptor supports the following user roles:
+ * - Admin: Full access to all resources.
+ * - Patient: Access to their own resources.
+ * - Practitioner: Access to resources related to their patients.
+ * 
+ * The interceptor also handles unauthenticated paths, JWT token parsing, and
+ * resource reference checks.
+ * 
+ * Methods:
+ * - buildRuleList(RequestDetails theRequestDetails): Builds a list of
+ * authorization rules based on the request details.
+ * - getUserRoleAndId(String jwtToken): Extracts the user role and ID from the
+ * JWT token.
+ * - isUnauthenticatedPath(String requestPath): Checks if the request path is in
+ * the list of unauthenticated paths.
+ * - parseJwtToken(String jwtToken): Parses the JWT token and returns the
+ * claims.
+ * - buildRulesBasedOnUserRole(String userRole, String userId, RequestDetails
+ * theRequestDetails): Builds authorization rules based on the user role.
+ * - buildPatientRules(String userId): Builds authorization rules for the
+ * Patient role.
+ * - buildPractitionerRules(String userId, RequestDetails theRequestDetails):
+ * Builds authorization rules for the Practitioner role.
+ * - createFhirClient(String baseUrl): Creates a FHIR client with a JWT token.
+ * - generateJwtToken(): Generates a new JWT token.
+ * - getPatientsWithPractitioner(RequestDetails theRequestDetails, String
+ * practitionerId): Retrieves patients associated with a practitioner.
+ * - preProcessResource(RequestDetails theRequest, ResponseDetails
+ * theResponseDetails): Pre-processes resources before sending the response.
+ * - processBundleResource(RequestDetails theRequest, Bundle bundle): Processes
+ * a bundle resource and checks references.
+ * - processBinaryResource(RequestDetails theRequest, ResponseDetails
+ * theResponseDetails): Processes a binary resource and checks references.
+ * - checkReferences(IBaseResource resource, String resourceId): Checks if the
+ * resource contains references to the specified resource ID.
+ * 
+ * Hooks:
+ * - SERVER_OUTGOING_RESPONSE: Hook for processing resources before sending the
+ * response.
+ * 
+ * Exceptions:
+ * - AuthenticationException: Thrown when authentication fails.
  */
 @Interceptor
 public class JWTSecurityInterceptor extends AuthorizationInterceptor {
@@ -148,7 +187,8 @@ public class JWTSecurityInterceptor extends AuthorizationInterceptor {
                 requestPath.equals("$get-resource-counts") ||
                 requestPath.equals("metadata") ||
                 requestPath.equals("$meta") ||
-                requestPath.equals("_history");
+                requestPath.equals("_history") ||
+                requestPath.startsWith("Practitioner"); // TODO: remove this line, temporary only.
     }
 
     private Jws<Claims> parseJwtToken(String jwtToken) {
@@ -221,6 +261,11 @@ public class JWTSecurityInterceptor extends AuthorizationInterceptor {
         ruleBuilder.allow().read().resourcesOfType("Questionnaire").withAnyId().andThen()
                 .allow().write().resourcesOfType("Questionnaire").withAnyId().andThen();
 
+        ruleBuilder.allow().read().resourcesOfType("QuestionnaireResponse")
+                .inCompartment("Practitioner", new IdType("Practitioner", userId)).andThen()
+                .allow().write().resourcesOfType("QuestionnaireResponse")
+                .inCompartment("Practitioner", new IdType("Practitioner", userId)).andThen();
+
         return ruleBuilder.denyAll("Deny all Practitioner Role").build();
     }
 
@@ -228,6 +273,7 @@ public class JWTSecurityInterceptor extends AuthorizationInterceptor {
         if (client == null || jwtToken == null || jwtExpiration == null || jwtExpiration.before(new Date())) {
             // Create FHIR context and client
             FhirContext ctx = FhirContext.forR4();
+            ctx.getRestfulClientFactory().setSocketTimeout(60 * 1000); // 1 minute
             client = ctx.newRestfulGenericClient(baseUrl);
 
             // Generate a new JWT token
@@ -271,9 +317,37 @@ public class JWTSecurityInterceptor extends AuthorizationInterceptor {
     }
 
     @Hook(Pointcut.SERVER_OUTGOING_RESPONSE)
-    public void preProcessBinaryResource(RequestDetails theRequest, ResponseDetails theResponseDetails) {
+    public void preProcessResource(RequestDetails theRequest, ResponseDetails theResponseDetails) {
         if (theResponseDetails.getResponseResource() instanceof Binary) {
             processBinaryResource(theRequest, theResponseDetails);
+        }
+
+    }
+
+    private void processBundleResource(RequestDetails theRequest, Bundle bundle) {
+
+        String authHeader = theRequest.getHeader("Authorization");
+        if (authHeader == null)
+            throw new AuthenticationException("Must provide Authorization");
+
+        String jwtToken = authHeader.substring(7); // Remove "Bearer "
+        System.out.println("Token: " + jwtToken);
+
+        try {
+            Pair<String, String> userRoleAndId = getUserRoleAndId(jwtToken);
+            String userRole = userRoleAndId.getFirst();
+            String userId = userRoleAndId.getSecond();
+            if ("Admin".equals(userRole)) {
+                return;
+            }
+            for (Bundle.BundleEntryComponent entry : bundle.getEntry()) {
+                IBaseResource resource = entry.getResource();
+                if (!checkReferences(resource, userId)) {
+                    throw new AuthenticationException("Unauthorized access to resource in bundle");
+                }
+            }
+        } catch (AuthenticationException e) {
+            throw e;
         }
     }
 
@@ -316,11 +390,12 @@ public class JWTSecurityInterceptor extends AuthorizationInterceptor {
                         return true;
                     }
                 } else if (childElementDef.getChildType() != null && child instanceof IBaseResource) {
-                    checkReferences((IBaseResource) child, resourceId);
+                    if (checkReferences((IBaseResource) child, resourceId)) { // Recursive call with return
+                        return true;
+                    }
                 }
             }
         }
         return false;
     }
-
 }
